@@ -40,9 +40,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
-from mcp.server.fastmcp import FastMCP
+# The SDK renamed its high-level server class in 2.0: mcp.server.fastmcp.FastMCP
+# became mcp.server.mcpserver.MCPServer. The decorator and run() signatures we
+# rely on are the same in both, so support either rather than pinning a major.
+try:
+    from mcp.server.mcpserver import MCPServer as _Server  # mcp >= 2.0
+except ModuleNotFoundError:
+    try:
+        from mcp.server.fastmcp import FastMCP as _Server  # mcp 1.2 .. 1.x
+    except ModuleNotFoundError as exc:
+        raise SystemExit(
+            "Could not import the MCP server class from the 'mcp' package.\n"
+            "Install it into this interpreter's environment:\n"
+            "    python -m pip install -r requirements.txt"
+        ) from exc
 
-mcp = FastMCP("static-site-sync")
+mcp = _Server("static-site-sync")
 
 DEFAULT_SUFFIXES = (
     ".html,.htm,.css,.js,.mjs,.map,"

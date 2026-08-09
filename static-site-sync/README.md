@@ -67,6 +67,9 @@ normalising after every sync removes that failure mode permanently.
 ## Requirements
 
 - Python 3.10 or newer
+- The `mcp` SDK, either 1.x or 2.x — the high-level server class moved from
+  `mcp.server.fastmcp.FastMCP` to `mcp.server.mcpserver.MCPServer` in 2.0, and
+  the import here handles both
 - An OpenSSH client on `PATH`
 - Key-based SSH access that works non-interactively
 
