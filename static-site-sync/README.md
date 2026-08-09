@@ -70,8 +70,26 @@ normalising after every sync removes that failure mode permanently.
 - The `mcp` SDK, either 1.x or 2.x — the high-level server class moved from
   `mcp.server.fastmcp.FastMCP` to `mcp.server.mcpserver.MCPServer` in 2.0, and
   the import here handles both
-- An OpenSSH client on `PATH`
 - Key-based SSH access that works non-interactively
+- Either an OpenSSH client on `PATH`, or `paramiko` (see below)
+
+## Two SSH backends
+
+`SSH_BACKEND=openssh` (the default) runs the `ssh` binary and inherits whatever
+already works in your shell — config, agent, known_hosts.
+
+`SSH_BACKEND=paramiko` speaks SSH from inside the Python process and needs no
+`ssh` binary. Use it when the application launching this server does so in a
+context where `ssh` cannot start: the symptom is exit code 255 with no output
+at all, even from `ssh -V`, while an identical command works in a terminal. The
+paramiko backend still reads `~/.ssh/config`, so a host alias in `SSH_HOST`
+keeps working, and it verifies host keys against `~/.ssh/known_hosts`.
+
+When SSH fails, `site_status` runs a self-test that separates the possible
+causes: whether child processes run at all, whether `ssh` starts, whether it
+can read its own configuration, whether its output reaches this process, and
+whether a plain TCP connection to port 22 succeeds. That last one tells you
+whether the paramiko backend is worth trying.
 
 The server calls `ssh` with `BatchMode=yes`, so a key that needs a passphrase
 produces an error instead of hanging. Use an agent, or a key without one.

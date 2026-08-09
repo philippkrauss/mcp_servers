@@ -27,13 +27,17 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import os
 import re
 import shlex
+import shutil
 import socket
 import ssl
 import subprocess
+import sys
 import tarfile
+import tempfile
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -141,6 +145,47 @@ class Config:
                 raise ConfigError(f"{key} in {env_path} is not a number: {raw!r}") from exc
 
         self.ssh_host = required("SSH_HOST")
+
+        # An MCP client may launch this server with a different PATH than an
+        # interactive shell. On Windows in particular, a Git installation puts
+        # its own MSYS2 ssh.exe ahead of the OpenSSH one, and that build
+        # resolves ~/.ssh elsewhere - which shows up as exit code 255 with no
+        # error text. Pinning an absolute path here removes the ambiguity.
+        self.ssh_command = values.get("SSH_COMMAND", "").strip() or "ssh"
+
+        # "openssh" shells out to the ssh binary and inherits your existing
+        # setup. "paramiko" speaks SSH from inside this process instead, which
+        # is the way out when the host application launches this server in a
+        # context where ssh.exe cannot start - a restriction that shows up as
+        # exit code 255 with no output, even for "ssh -V".
+        self.ssh_backend = (values.get("SSH_BACKEND", "").strip() or "openssh").lower()
+        if self.ssh_backend not in {"openssh", "paramiko"}:
+            raise ConfigError(
+                f"SSH_BACKEND must be 'openssh' or 'paramiko', not {self.ssh_backend!r}."
+            )
+
+        # Only consulted by the paramiko backend, and only to override what it
+        # would otherwise read from your ssh config for SSH_HOST.
+        self.ssh_user = values.get("SSH_USER", "").strip()
+        self.ssh_port = int(number("SSH_PORT", 0)) or None
+        self.ssh_key_file = values.get("SSH_KEY_FILE", "").strip()
+        self.ssh_config_file = values.get("SSH_CONFIG_FILE", "").strip()
+        self.strict_host_keys = (
+            values.get("SSH_STRICT_HOST_KEYS", "").strip().lower() not in {"0", "false", "no"}
+        )
+        self.ssh_debug = (
+            values.get("SSH_DEBUG", "").strip().lower() in {"1", "true", "yes"}
+        )
+
+        # Extra arguments inserted before the destination, e.g. -F to point at a
+        # config file explicitly. Useful when the launching process does not
+        # share the environment that lets ssh find ~/.ssh by itself.
+        raw_args = values.get("SSH_EXTRA_ARGS", "").strip()
+        self.ssh_extra_args = [
+            token[1:-1] if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'"
+            else token
+            for token in shlex.split(raw_args, posix=False)
+        ] if raw_args else []
         self.local_dir = Path(required("LOCAL_DIR"))
         self.remote_dir = required("REMOTE_DIR").rstrip("/")
 
@@ -204,18 +249,29 @@ def _config() -> Config:
 # ---------------------------------------------------------------------------
 
 
-def _ssh(command: str, stdin: bytes | None = None,
-         timeout: int | None = None) -> tuple[int, str, str]:
-    """Run a command on the remote host.
+def _ssh(command: str, stdin: bytes | None = None, timeout: int | None = None,
+         extra_args: list[str] | None = None) -> tuple[int, str, str]:
+    """Run a command on the remote host using the configured backend."""
+    cfg = _config()
+    if cfg.ssh_backend == "paramiko":
+        return _ssh_paramiko(command, stdin, timeout or cfg.ssh_timeout)
+    return _ssh_openssh(command, stdin, timeout, extra_args)
+
+
+def _ssh_openssh(command: str, stdin: bytes | None = None, timeout: int | None = None,
+                 extra_args: list[str] | None = None) -> tuple[int, str, str]:
+    """Run a command on the remote host by spawning the ssh binary.
 
     BatchMode makes ssh fail instead of prompting, so a key that needs a
     passphrase produces an error rather than a hang.
     """
     cfg = _config()
     argv = [
-        "ssh",
+        cfg.ssh_command,
         "-o", "BatchMode=yes",
         "-o", "ConnectTimeout=10",
+        *cfg.ssh_extra_args,
+        *(extra_args or []),
         cfg.ssh_host,
         command,
     ]
@@ -227,7 +283,10 @@ def _ssh(command: str, stdin: bytes | None = None,
             timeout=timeout or cfg.ssh_timeout,
         )
     except FileNotFoundError as exc:
-        raise SyncError("ssh was not found on PATH. Is an OpenSSH client installed?") from exc
+        raise SyncError(
+            f"{cfg.ssh_command!r} was not found. Install an OpenSSH client, or set "
+            "SSH_COMMAND in the .env file to its absolute path."
+        ) from exc
     except subprocess.TimeoutExpired as exc:
         raise SyncError(
             f"SSH call timed out after {timeout or cfg.ssh_timeout}s. "
@@ -242,14 +301,302 @@ def _ssh(command: str, stdin: bytes | None = None,
     )
 
 
+def _ssh_target() -> dict[str, object]:
+    """Resolve SSH_HOST through the ssh config, then apply explicit overrides.
+
+    Keeps host aliases working under the paramiko backend, so the same entry
+    in ~/.ssh/config drives both backends.
+    """
+    import paramiko
+
+    cfg = _config()
+    target: dict[str, object] = {
+        "hostname": cfg.ssh_host,
+        "port": 22,
+        "username": None,
+        "key_filenames": [],
+    }
+
+    config_path = Path(cfg.ssh_config_file) if cfg.ssh_config_file else (
+        Path(os.path.expanduser("~")) / ".ssh" / "config"
+    )
+    if config_path.is_file():
+        parsed = paramiko.SSHConfig()
+        with config_path.open(encoding="utf-8", errors="replace") as handle:
+            parsed.parse(handle)
+        entry = parsed.lookup(cfg.ssh_host)
+        target["hostname"] = entry.get("hostname", cfg.ssh_host)
+        if entry.get("port"):
+            target["port"] = int(entry["port"])
+        if entry.get("user"):
+            target["username"] = entry["user"]
+        target["key_filenames"] = [
+            os.path.expanduser(item) for item in entry.get("identityfile", []) or []
+        ]
+
+    if cfg.ssh_user:
+        target["username"] = cfg.ssh_user
+    if cfg.ssh_port:
+        target["port"] = cfg.ssh_port
+    if cfg.ssh_key_file:
+        target["key_filenames"] = [os.path.expanduser(cfg.ssh_key_file)]
+    if not target["username"]:
+        target["username"] = os.environ.get("USERNAME") or os.environ.get("USER")
+
+    return target
+
+
+def _ssh_paramiko(command: str, stdin: bytes | None,
+                  timeout: int) -> tuple[int, str, str]:
+    """Run a remote command without spawning an ssh process."""
+    cfg = _config()
+    try:
+        import paramiko
+    except ModuleNotFoundError as exc:
+        raise SyncError(
+            "SSH_BACKEND is 'paramiko' but the paramiko package is not installed.\n"
+            "    python -m pip install paramiko"
+        ) from exc
+
+    # paramiko logs through the logging module, which without configuration
+    # reaches stderr and never stdout. That matters: this process speaks the
+    # MCP protocol on stdout, and a stray byte there would corrupt it. The host
+    # application captures stderr into its own log, so raising the level when
+    # asked puts the full handshake somewhere useful.
+    if cfg.ssh_debug:
+        logging.getLogger("paramiko").setLevel(logging.DEBUG)
+        if not logging.getLogger().handlers:
+            logging.basicConfig(stream=sys.stderr, level=logging.DEBUG)
+
+    target = _ssh_target()
+    client = paramiko.SSHClient()
+
+    known_hosts = Path(os.path.expanduser("~")) / ".ssh" / "known_hosts"
+    if known_hosts.is_file():
+        try:
+            client.load_host_keys(str(known_hosts))
+        except Exception:  # noqa: BLE001 - a malformed entry must not be fatal
+            client.load_system_host_keys()
+    client.set_missing_host_key_policy(
+        paramiko.RejectPolicy() if cfg.strict_host_keys else paramiko.AutoAddPolicy()
+    )
+
+    try:
+        client.connect(
+            hostname=str(target["hostname"]),
+            port=int(target["port"]),
+            username=target["username"] or None,
+            key_filename=list(target["key_filenames"]) or None,
+            timeout=10,
+            auth_timeout=15,
+            banner_timeout=15,
+            allow_agent=True,
+            look_for_keys=True,
+        )
+    except paramiko.ssh_exception.SSHException as exc:
+        hint = ""
+        if "not found in known_hosts" in str(exc):
+            hint = (
+                "\nThe host key is not in ~/.ssh/known_hosts as read by this process. "
+                "Connect once from a shell, or set SSH_STRICT_HOST_KEYS=false after "
+                "verifying the fingerprint."
+            )
+        raise SyncError(f"paramiko could not connect: {exc}{hint}") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise SyncError(
+            f"paramiko could not connect to "
+            f"{target['username']}@{target['hostname']}:{target['port']}: {exc}"
+        ) from exc
+
+    try:
+        transport = client.get_transport()
+        channel = transport.open_session(timeout=timeout)
+        channel.settimeout(timeout)
+        channel.exec_command(command)
+
+        if stdin:
+            channel.sendall(stdin)
+        channel.shutdown_write()
+
+        out = channel.makefile("rb").read()
+        err = channel.makefile_stderr("rb").read()
+        code = channel.recv_exit_status()
+    except Exception as exc:  # noqa: BLE001
+        raise SyncError(f"paramiko failed while running the remote command: {exc}") from exc
+    finally:
+        client.close()
+
+    return code, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+
+
+def _ssh_binary() -> str:
+    """Absolute path of the ssh executable that will actually be used."""
+    cfg = _config()
+    resolved = shutil.which(cfg.ssh_command)
+    return resolved or f"{cfg.ssh_command} (not found on PATH)"
+
+
+def _environment_report() -> str:
+    """What this process knows about the user's home directory.
+
+    ssh locates ~/.ssh through the environment. A process launched by a GUI
+    application does not necessarily inherit the same variables as a shell, and
+    when that lookup fails ssh can exit before it has produced any output at
+    all - which is otherwise a very confusing symptom.
+    """
+    lines = ["  Environment as seen by this server process:"]
+    for name in ("USERPROFILE", "HOME", "HOMEDRIVE", "HOMEPATH", "USERNAME"):
+        lines.append(f"    {name} = {os.environ.get(name) or '(not set)'}")
+
+    home = os.environ.get("USERPROFILE") or os.environ.get("HOME")
+    if not home:
+        lines.append("    No home variable is set - ssh cannot locate ~/.ssh")
+        return "\n".join(lines)
+
+    ssh_dir = Path(home) / ".ssh"
+    lines.append(f"    {ssh_dir} is a directory: {ssh_dir.is_dir()}")
+    for name in ("config", "known_hosts"):
+        candidate = ssh_dir / name
+        if not candidate.exists():
+            state = "missing"
+        elif os.access(candidate, os.R_OK):
+            state = "readable"
+        else:
+            state = "present but not readable"
+        lines.append(f"    {name}: {state}")
+    return "\n".join(lines)
+
+
+def _run(argv: list[str], timeout: int = 20) -> tuple[int, str, str]:
+    """Plain subprocess call used only by the self-test."""
+    try:
+        proc = subprocess.run(argv, input=b"", capture_output=True, timeout=timeout)
+    except FileNotFoundError:
+        return -1, "", "executable not found"
+    except subprocess.TimeoutExpired:
+        return -2, "", f"timed out after {timeout}s"
+    return (
+        proc.returncode,
+        proc.stdout.decode("utf-8", "replace").strip(),
+        proc.stderr.decode("utf-8", "replace").strip(),
+    )
+
+
+def _ssh_selftest() -> str:
+    """Narrow down why ssh fails, one layer at a time.
+
+    Each step rules out a class of cause: whether any child process runs at
+    all, whether ssh itself starts, whether it can read its own configuration,
+    whether its output reaches us, and whether this process can open a TCP
+    connection to the target.
+    """
+    cfg = _config()
+    lines = ["  Self-test:", f"    backend              : {cfg.ssh_backend}"]
+
+    try:
+        import paramiko  # noqa: F401
+
+        lines.append("    paramiko installed   : yes")
+    except ModuleNotFoundError:
+        lines.append("    paramiko installed   : no  (pip install paramiko)")
+
+    code, out, err = _run(["cmd", "/c", "echo", "ok"] if os.name == "nt" else ["echo", "ok"])
+    lines.append(f"    child process        : exit {code}, output {out or err or '(none)'!r}")
+
+    code, out, err = _run([cfg.ssh_command, "-V"])
+    lines.append(f"    ssh -V               : exit {code}, {(err or out or '(no output)')[:90]}")
+    ssh_starts = code == 0 and bool(err or out)
+
+    hostname, port = None, "22"
+    if ssh_starts:
+        code, out, err = _run([cfg.ssh_command, "-G", cfg.ssh_host])
+        if code == 0 and out:
+            for line in out.splitlines():
+                key, _, value = line.strip().partition(" ")
+                if key == "hostname":
+                    hostname = value
+                elif key == "port":
+                    port = value
+            lines.append(f"    ssh -G {cfg.ssh_host:<14}: resolves to {hostname}:{port}")
+        else:
+            lines.append(
+                f"    ssh -G {cfg.ssh_host:<14}: exit {code}, {(err or '(no output)')[:90]}"
+            )
+
+    # If ssh writes nothing to our pipes, a log file tells us whether it is
+    # producing no output at all or whether the output is being intercepted.
+    log_path = Path(tempfile.gettempdir()) / "static-site-sync-ssh.log"
+    log_path.unlink(missing_ok=True)
+    try:
+        if cfg.ssh_backend != "openssh":
+            raise SyncError("only meaningful for the openssh backend")
+        code, _, _ = _ssh("true", timeout=30, extra_args=["-vvv", "-E", str(log_path)])
+    except SyncError as exc:
+        lines.append(f"    ssh -E logfile       : skipped ({exc})")
+        code = None
+    if code is not None and log_path.exists():
+        content = log_path.read_text("utf-8", "replace").strip().splitlines()
+        lines.append(f"    ssh -E logfile       : exit {code}, {len(content)} lines written")
+        if content:
+            lines.append("      " + "\n      ".join(line.strip() for line in content[-12:]))
+        log_path.unlink(missing_ok=True)
+    elif code is not None:
+        lines.append(f"    ssh -E logfile       : exit {code}, no log file was created")
+
+    # The TCP probe is the decisive one: it tells us whether this process may
+    # reach port 22 at all, which is what determines whether the paramiko
+    # backend can work. Resolve the target without ssh if we have to.
+    if not hostname:
+        try:
+            hostname = str(_ssh_target()["hostname"])
+            port = str(_ssh_target()["port"])
+            lines.append(f"    ssh config (parsed)  : {cfg.ssh_host} -> {hostname}:{port}")
+        except Exception:  # noqa: BLE001
+            if cfg.site_url:
+                hostname = urlparse(cfg.site_url).hostname
+                lines.append(f"    falling back to SITE_URL host for the TCP probe")
+
+    if hostname:
+        try:
+            with socket.create_connection((hostname, int(port)), timeout=8) as sock:
+                sock.settimeout(5)
+                banner = sock.recv(128).decode("utf-8", "replace").strip()
+            lines.append(f"    TCP {hostname}:{port} : open, banner {banner[:60]!r}")
+            lines.append(
+                "      -> the network path is fine; if ssh.exe cannot start, "
+                "set SSH_BACKEND=paramiko"
+            )
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"    TCP {hostname}:{port} : FAILED ({exc})")
+
+    return "\n".join(lines)
+
+
 def _ssh_checked(command: str, stdin: bytes | None = None,
                  timeout: int | None = None) -> str:
+    cfg = _config()
     code, out, err = _ssh(command, stdin=stdin, timeout=timeout)
     if code != 0:
-        raise SyncError(
-            f"Remote command failed with exit code {code}.\n"
-            f"stderr: {err.strip() or '(empty)'}"
-        )
+        detail = [
+            f"Remote command failed with exit code {code}.",
+            f"ssh binary: {_ssh_binary()}",
+            f"ssh target: {cfg.ssh_host}",
+            f"stderr: {err.strip() or '(empty)'}",
+        ]
+        if out.strip():
+            detail.append(f"stdout: {out.strip()[:500]}")
+        if code == 255:
+            detail.append(
+                "\nExit code 255 comes from ssh itself, not from the remote command - "
+                "the connection was never established. Common causes: the host alias "
+                "cannot be resolved because this process does not see the same "
+                "~/.ssh/config as your shell; the host key is not in known_hosts and "
+                "BatchMode turns the prompt into an error; or a different ssh build is "
+                "first on PATH (on Windows, Git ships its own). Compare the binary "
+                "above with the one your shell uses, and set SSH_COMMAND in the .env "
+                "file to an absolute path if they differ."
+            )
+        raise SyncError("\n".join(detail))
     return out
 
 
@@ -474,6 +821,54 @@ def site_status() -> str:
                 )
             except Exception as exc:  # noqa: BLE001
                 report.append(f"Certificate: could not be checked ({exc})")
+
+    if cfg.ssh_backend == "paramiko":
+        try:
+            target = _ssh_target()
+            report.append(
+                f"SSH backend: paramiko -> {target['username']}@{target['hostname']}"
+                f":{target['port']}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            report.append(f"SSH backend: paramiko (target not resolvable: {exc})")
+    else:
+        report.append(f"SSH backend: openssh, binary {_ssh_binary()}")
+    try:
+        code, out, err = _ssh("echo reachable", timeout=30)
+        if code == 0 and "reachable" in out:
+            report.append(f"SSH:         connected to {cfg.ssh_host}")
+        else:
+            report.append(
+                f"SSH:         FAILED (exit {code}) - {err.strip() or 'no error output'}"
+            )
+            # ssh is normally talkative on failure. When it is not, the useful
+            # information is in the verbose log, so fetch it rather than making
+            # someone reproduce the call by hand.
+            try:
+                _, vout, verr = _ssh("true", timeout=30, extra_args=["-vvv"])
+                trace = (verr + vout).strip().splitlines()
+                if trace:
+                    report.append(
+                        "\nVerbose ssh trace (last 25 lines):\n  "
+                        + "\n  ".join(line.strip() for line in trace[-25:])
+                    )
+                else:
+                    report.append(
+                        "\nEven with -vvv, ssh produced no output at all. It therefore "
+                        "failed before it started logging, which points at the process "
+                        "environment rather than at the ssh configuration."
+                    )
+            except SyncError as exc:
+                report.append(f"  verbose retry also failed: {exc}")
+            report.append("\n" + _environment_report())
+            if cfg.ssh_extra_args:
+                report.append(f"  SSH_EXTRA_ARGS: {cfg.ssh_extra_args}")
+            try:
+                report.append("\n" + _ssh_selftest())
+            except Exception as exc:  # noqa: BLE001
+                report.append(f"  self-test failed: {exc}")
+    except SyncError as exc:
+        report.append(f"SSH:         FAILED - {exc}")
 
     if cfg.container_name:
         try:
