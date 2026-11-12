@@ -8,6 +8,8 @@ deployed anywhere.
 | Server | Purpose |
 |---|---|
 | [static-site-sync](static-site-sync/) | Mirrors a local directory to a remote web root over SSH |
+| [influx-query](influx-query/) | Read-only Flux queries against InfluxDB 2.x, with CSV export |
+| [ksuite-calendar](ksuite-calendar/) | Calendars and task lists over CalDAV; reads, creates, deletes only its own entries |
 
 ## Conventions
 
