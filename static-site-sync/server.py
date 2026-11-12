@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import logging
 import os
 import re
 import shlex
@@ -35,9 +34,7 @@ import shutil
 import socket
 import ssl
 import subprocess
-import sys
 import tarfile
-import tempfile
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -173,9 +170,6 @@ class Config:
         self.strict_host_keys = (
             values.get("SSH_STRICT_HOST_KEYS", "").strip().lower() not in {"0", "false", "no"}
         )
-        self.ssh_debug = (
-            values.get("SSH_DEBUG", "").strip().lower() in {"1", "true", "yes"}
-        )
 
         # Extra arguments inserted before the destination, e.g. -F to point at a
         # config file explicitly. Useful when the launching process does not
@@ -249,17 +243,17 @@ def _config() -> Config:
 # ---------------------------------------------------------------------------
 
 
-def _ssh(command: str, stdin: bytes | None = None, timeout: int | None = None,
-         extra_args: list[str] | None = None) -> tuple[int, str, str]:
+def _ssh(command: str, stdin: bytes | None = None,
+         timeout: int | None = None) -> tuple[int, str, str]:
     """Run a command on the remote host using the configured backend."""
     cfg = _config()
     if cfg.ssh_backend == "paramiko":
         return _ssh_paramiko(command, stdin, timeout or cfg.ssh_timeout)
-    return _ssh_openssh(command, stdin, timeout, extra_args)
+    return _ssh_openssh(command, stdin, timeout)
 
 
-def _ssh_openssh(command: str, stdin: bytes | None = None, timeout: int | None = None,
-                 extra_args: list[str] | None = None) -> tuple[int, str, str]:
+def _ssh_openssh(command: str, stdin: bytes | None = None,
+                 timeout: int | None = None) -> tuple[int, str, str]:
     """Run a command on the remote host by spawning the ssh binary.
 
     BatchMode makes ssh fail instead of prompting, so a key that needs a
@@ -271,7 +265,6 @@ def _ssh_openssh(command: str, stdin: bytes | None = None, timeout: int | None =
         "-o", "BatchMode=yes",
         "-o", "ConnectTimeout=10",
         *cfg.ssh_extra_args,
-        *(extra_args or []),
         cfg.ssh_host,
         command,
     ]
@@ -360,14 +353,7 @@ def _ssh_paramiko(command: str, stdin: bytes | None,
 
     # paramiko logs through the logging module, which without configuration
     # reaches stderr and never stdout. That matters: this process speaks the
-    # MCP protocol on stdout, and a stray byte there would corrupt it. The host
-    # application captures stderr into its own log, so raising the level when
-    # asked puts the full handshake somewhere useful.
-    if cfg.ssh_debug:
-        logging.getLogger("paramiko").setLevel(logging.DEBUG)
-        if not logging.getLogger().handlers:
-            logging.basicConfig(stream=sys.stderr, level=logging.DEBUG)
-
+    # MCP protocol on stdout, and a stray byte there would corrupt it.
     target = _ssh_target()
     client = paramiko.SSHClient()
 
@@ -436,156 +422,21 @@ def _ssh_binary() -> str:
     return resolved or f"{cfg.ssh_command} (not found on PATH)"
 
 
-def _environment_report() -> str:
-    """What this process knows about the user's home directory.
-
-    ssh locates ~/.ssh through the environment. A process launched by a GUI
-    application does not necessarily inherit the same variables as a shell, and
-    when that lookup fails ssh can exit before it has produced any output at
-    all - which is otherwise a very confusing symptom.
-    """
-    lines = ["  Environment as seen by this server process:"]
-    for name in ("USERPROFILE", "HOME", "HOMEDRIVE", "HOMEPATH", "USERNAME"):
-        lines.append(f"    {name} = {os.environ.get(name) or '(not set)'}")
-
-    home = os.environ.get("USERPROFILE") or os.environ.get("HOME")
-    if not home:
-        lines.append("    No home variable is set - ssh cannot locate ~/.ssh")
-        return "\n".join(lines)
-
-    ssh_dir = Path(home) / ".ssh"
-    lines.append(f"    {ssh_dir} is a directory: {ssh_dir.is_dir()}")
-    for name in ("config", "known_hosts"):
-        candidate = ssh_dir / name
-        if not candidate.exists():
-            state = "missing"
-        elif os.access(candidate, os.R_OK):
-            state = "readable"
-        else:
-            state = "present but not readable"
-        lines.append(f"    {name}: {state}")
-    return "\n".join(lines)
-
-
-def _run(argv: list[str], timeout: int = 20) -> tuple[int, str, str]:
-    """Plain subprocess call used only by the self-test."""
-    try:
-        proc = subprocess.run(argv, input=b"", capture_output=True, timeout=timeout)
-    except FileNotFoundError:
-        return -1, "", "executable not found"
-    except subprocess.TimeoutExpired:
-        return -2, "", f"timed out after {timeout}s"
-    return (
-        proc.returncode,
-        proc.stdout.decode("utf-8", "replace").strip(),
-        proc.stderr.decode("utf-8", "replace").strip(),
-    )
-
-
-def _ssh_selftest() -> str:
-    """Narrow down why ssh fails, one layer at a time.
-
-    Each step rules out a class of cause: whether any child process runs at
-    all, whether ssh itself starts, whether it can read its own configuration,
-    whether its output reaches us, and whether this process can open a TCP
-    connection to the target.
-    """
-    cfg = _config()
-    lines = ["  Self-test:", f"    backend              : {cfg.ssh_backend}"]
-
-    try:
-        import paramiko  # noqa: F401
-
-        lines.append("    paramiko installed   : yes")
-    except ModuleNotFoundError:
-        lines.append("    paramiko installed   : no  (pip install paramiko)")
-
-    code, out, err = _run(["cmd", "/c", "echo", "ok"] if os.name == "nt" else ["echo", "ok"])
-    lines.append(f"    child process        : exit {code}, output {out or err or '(none)'!r}")
-
-    code, out, err = _run([cfg.ssh_command, "-V"])
-    lines.append(f"    ssh -V               : exit {code}, {(err or out or '(no output)')[:90]}")
-    ssh_starts = code == 0 and bool(err or out)
-
-    hostname, port = None, "22"
-    if ssh_starts:
-        code, out, err = _run([cfg.ssh_command, "-G", cfg.ssh_host])
-        if code == 0 and out:
-            for line in out.splitlines():
-                key, _, value = line.strip().partition(" ")
-                if key == "hostname":
-                    hostname = value
-                elif key == "port":
-                    port = value
-            lines.append(f"    ssh -G {cfg.ssh_host:<14}: resolves to {hostname}:{port}")
-        else:
-            lines.append(
-                f"    ssh -G {cfg.ssh_host:<14}: exit {code}, {(err or '(no output)')[:90]}"
-            )
-
-    # If ssh writes nothing to our pipes, a log file tells us whether it is
-    # producing no output at all or whether the output is being intercepted.
-    log_path = Path(tempfile.gettempdir()) / "static-site-sync-ssh.log"
-    log_path.unlink(missing_ok=True)
-    try:
-        if cfg.ssh_backend != "openssh":
-            raise SyncError("only meaningful for the openssh backend")
-        code, _, _ = _ssh("true", timeout=30, extra_args=["-vvv", "-E", str(log_path)])
-    except SyncError as exc:
-        lines.append(f"    ssh -E logfile       : skipped ({exc})")
-        code = None
-    if code is not None and log_path.exists():
-        content = log_path.read_text("utf-8", "replace").strip().splitlines()
-        lines.append(f"    ssh -E logfile       : exit {code}, {len(content)} lines written")
-        if content:
-            lines.append("      " + "\n      ".join(line.strip() for line in content[-12:]))
-        log_path.unlink(missing_ok=True)
-    elif code is not None:
-        lines.append(f"    ssh -E logfile       : exit {code}, no log file was created")
-
-    # The TCP probe is the decisive one: it tells us whether this process may
-    # reach port 22 at all, which is what determines whether the paramiko
-    # backend can work. Resolve the target without ssh if we have to.
-    if not hostname:
-        try:
-            hostname = str(_ssh_target()["hostname"])
-            port = str(_ssh_target()["port"])
-            lines.append(f"    ssh config (parsed)  : {cfg.ssh_host} -> {hostname}:{port}")
-        except Exception:  # noqa: BLE001
-            if cfg.site_url:
-                hostname = urlparse(cfg.site_url).hostname
-                lines.append(f"    falling back to SITE_URL host for the TCP probe")
-
-    if hostname:
-        try:
-            with socket.create_connection((hostname, int(port)), timeout=8) as sock:
-                sock.settimeout(5)
-                banner = sock.recv(128).decode("utf-8", "replace").strip()
-            lines.append(f"    TCP {hostname}:{port} : open, banner {banner[:60]!r}")
-            lines.append(
-                "      -> the network path is fine; if ssh.exe cannot start, "
-                "set SSH_BACKEND=paramiko"
-            )
-        except Exception as exc:  # noqa: BLE001
-            lines.append(f"    TCP {hostname}:{port} : FAILED ({exc})")
-
-    return "\n".join(lines)
-
-
 def _ssh_checked(command: str, stdin: bytes | None = None,
                  timeout: int | None = None) -> str:
     cfg = _config()
     code, out, err = _ssh(command, stdin=stdin, timeout=timeout)
     if code != 0:
-        detail = [
-            f"Remote command failed with exit code {code}.",
-            f"ssh binary: {_ssh_binary()}",
+        detail = [f"Remote command failed with exit code {code}."]
+        if cfg.ssh_backend == "openssh":
+            detail.append(f"ssh binary: {_ssh_binary()}")
+        detail += [
             f"ssh target: {cfg.ssh_host}",
             f"stderr: {err.strip() or '(empty)'}",
         ]
         if out.strip():
             detail.append(f"stdout: {out.strip()[:500]}")
-        if code == 255:
+        if code == 255 and cfg.ssh_backend == "openssh":
             detail.append(
                 "\nExit code 255 comes from ssh itself, not from the remote command - "
                 "the connection was never established. Common causes: the host alias "
@@ -841,32 +692,6 @@ def site_status() -> str:
             report.append(
                 f"SSH:         FAILED (exit {code}) - {err.strip() or 'no error output'}"
             )
-            # ssh is normally talkative on failure. When it is not, the useful
-            # information is in the verbose log, so fetch it rather than making
-            # someone reproduce the call by hand.
-            try:
-                _, vout, verr = _ssh("true", timeout=30, extra_args=["-vvv"])
-                trace = (verr + vout).strip().splitlines()
-                if trace:
-                    report.append(
-                        "\nVerbose ssh trace (last 25 lines):\n  "
-                        + "\n  ".join(line.strip() for line in trace[-25:])
-                    )
-                else:
-                    report.append(
-                        "\nEven with -vvv, ssh produced no output at all. It therefore "
-                        "failed before it started logging, which points at the process "
-                        "environment rather than at the ssh configuration."
-                    )
-            except SyncError as exc:
-                report.append(f"  verbose retry also failed: {exc}")
-            report.append("\n" + _environment_report())
-            if cfg.ssh_extra_args:
-                report.append(f"  SSH_EXTRA_ARGS: {cfg.ssh_extra_args}")
-            try:
-                report.append("\n" + _ssh_selftest())
-            except Exception as exc:  # noqa: BLE001
-                report.append(f"  self-test failed: {exc}")
     except SyncError as exc:
         report.append(f"SSH:         FAILED - {exc}")
 
@@ -1025,5 +850,93 @@ def site_deploy(allow_delete: bool = False) -> str:
     return "\n".join(result) + ("\n\n" + detail if detail else "")
 
 
+# ---------------------------------------------------------------------------
+# Command line
+# ---------------------------------------------------------------------------
+#
+# Without arguments this file is an MCP server, which is how MCP clients start
+# it. With a subcommand it runs the same tools for a human at a terminal, so a
+# site can be published without an assistant in the loop. Both paths call the
+# very same functions, so every safety check applies to both.
+
+
+def _deploy_ok(result: str) -> bool:
+    if result.startswith("Nothing to do"):
+        return True
+    return result.startswith("Sync complete.") and "Verification FAILED" not in result
+
+
+def _confirm(question: str) -> bool:
+    try:
+        answer = input(f"{question} [y/N] ")
+    except EOFError:  # no terminal attached - never assume yes
+        print()
+        return False
+    return answer.strip().lower() in ("y", "yes", "j", "ja")
+
+
+def cli(argv: list[str]) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="server.py",
+        description="Run the static-site-sync tools from a terminal. "
+                    "Without a subcommand, the MCP server starts instead.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("status", help="report the state of the site (read-only)")
+    sub.add_parser("diff", help="show what a deploy would change (read-only)")
+    deploy = sub.add_parser(
+        "deploy",
+        help="show the diff, ask, then mirror the local directory to the remote host",
+    )
+    deploy.add_argument(
+        "--allow-delete", action="store_true",
+        help="permit removing remote files that no longer exist locally",
+    )
+    deploy.add_argument(
+        "--yes", action="store_true",
+        help="skip the confirmation prompt",
+    )
+    args = parser.parse_args(argv)
+
+    if args.command == "status":
+        result = site_status()
+        print(result)
+        return 1 if "Configuration problem" in result else 0
+
+    preview = site_diff()
+    print(preview)
+    if preview.startswith("Comparison not possible"):
+        return 1
+    if args.command == "diff" or "No differences" in preview:
+        return 0
+
+    print()
+    if "Would be removed" in preview and not args.allow_delete:
+        print("Aborted - nothing was changed. Files would be deleted from the "
+              "remote host; run deploy again with --allow-delete if that is intended.")
+        return 1
+    if not args.yes and not _confirm("Deploy these changes to the live site?"):
+        print("Cancelled - nothing was changed.")
+        return 1
+
+    result = site_deploy(allow_delete=args.allow_delete)
+    print()
+    print(result)
+    return 0 if _deploy_ok(result) else 1
+
+
 if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) > 1:
+        # File names may contain characters a Windows console code page
+        # cannot encode; replace them rather than crash mid-report.
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(errors="replace")
+            except AttributeError:
+                pass
+        raise SystemExit(cli(sys.argv[1:]))
     mcp.run()

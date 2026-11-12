@@ -18,6 +18,25 @@ about.
 | `site_diff()` | read-only: dry run by SHA-256 comparison — what would be added, changed, removed |
 | `site_deploy(allow_delete=False)` | writes: mirrors the local directory to the remote host |
 
+## Command line
+
+The same tools run from a terminal, for publishing without an assistant:
+
+```sh
+python server.py status                  # read-only
+python server.py diff                    # read-only dry run
+python server.py deploy                  # shows the diff, asks, then deploys
+python server.py deploy --allow-delete   # also removes orphaned remote files
+python server.py deploy --yes            # no prompt, for scripts
+```
+
+Without a subcommand the file starts as an MCP server, which is how MCP
+clients launch it, so registering it stays unchanged. Both paths call the same
+functions and share every safety check. `deploy` refuses before prompting when
+files would be deleted and `--allow-delete` is missing. The exit code is `0`
+on success or when there is nothing to do, and `1` when something was refused,
+cancelled or failed.
+
 ## Scope
 
 The server touches exactly one remote directory. It does not deploy server
@@ -85,11 +104,10 @@ at all, even from `ssh -V`, while an identical command works in a terminal. The
 paramiko backend still reads `~/.ssh/config`, so a host alias in `SSH_HOST`
 keeps working, and it verifies host keys against `~/.ssh/known_hosts`.
 
-When SSH fails, `site_status` runs a self-test that separates the possible
-causes: whether child processes run at all, whether `ssh` starts, whether it
-can read its own configuration, whether its output reaches this process, and
-whether a plain TCP connection to port 22 succeeds. That last one tells you
-whether the paramiko backend is worth trying.
+When SSH fails, `site_status` reports the exit code and whatever the backend
+said. If that is exit code 255 with no output at all, the `ssh` binary never
+started — switch to `SSH_BACKEND=paramiko` rather than looking for a fault in
+your SSH configuration.
 
 The server calls `ssh` with `BatchMode=yes`, so a key that needs a passphrase
 produces an error instead of hanging. Use an agent, or a key without one.
